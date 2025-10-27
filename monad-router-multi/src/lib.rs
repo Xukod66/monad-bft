@@ -27,7 +27,7 @@ use futures::{Stream, StreamExt};
 use monad_crypto::certificate_signature::{
     CertificateSignaturePubKey, CertificateSignatureRecoverable,
 };
-use monad_dataplane::{DataplaneBuilder, DataplaneWriter};
+use monad_dataplane::{DataplaneBuilder, UdpSocketWriter};
 use monad_executor::{Executor, ExecutorMetricsChain};
 use monad_executor_glue::{Message, RouterCommand};
 use monad_node_config::{FullNodeConfig, FullNodeIdentityConfig};
@@ -50,6 +50,8 @@ use monad_types::{Epoch, NodeId};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 pub use tracing::{debug, error, info, warn, Level};
 
+const RAPTORCAST_SOCKET: &str = "raptorcast_udp_socket";
+
 //==============================================================================
 pub struct MultiRouter<ST, M, OM, SE, PD>
 where
@@ -66,8 +68,6 @@ where
     self_node_id: NodeId<CertificateSignaturePubKey<ST>>,
     current_epoch: Epoch,
     epoch_validators: BTreeMap<Epoch, BTreeSet<NodeId<CertificateSignaturePubKey<ST>>>>,
-    dp_writer: DataplaneWriter,
-    shared_pdd: Arc<Mutex<PeerDiscoveryDriver<PD>>>,
 
     phantom: PhantomData<(OM, SE)>,
 }
@@ -96,7 +96,14 @@ where
 
         let dp = dataplane_builder.build();
         assert!(dp.block_until_ready(Duration::from_secs(1)));
-        let (dp_reader, dp_writer) = dp.split();
+
+        let (tcp_socket, mut udp_dataplane, control) = dp.split();
+        let udp_socket = udp_dataplane
+            .take_socket(RAPTORCAST_SOCKET)
+            .expect("raptorcast socket");
+        let udp_writer_secondary = udp_socket.writer().clone();
+
+        let (tcp_reader, tcp_writer) = tcp_socket.split();
 
         // Create a channel between primary and secondary raptorcast instances.
         // Fundamentally this is needed because, while both can send, only the
@@ -118,11 +125,10 @@ where
                 SecondaryRaptorCastModeConfig::None
             };
 
-        // Instantiate secondary raptorcast instance
         let rc_secondary = Self::build_secondary(
             cfg.clone(),
             secondary_mode,
-            dp_writer.clone(),
+            udp_writer_secondary,
             shared_pdd.clone(),
             recv_net_messages,
             send_group_infos,
@@ -132,8 +138,10 @@ where
         let mut rc_primary = RaptorCast::new(
             cfg.clone(),
             secondary_mode,
-            dp_reader,
-            dp_writer.clone(),
+            tcp_reader,
+            tcp_writer.clone(),
+            udp_socket,
+            control,
             shared_pdd.clone(),
             current_epoch,
         );
@@ -146,46 +154,24 @@ where
             current_epoch,
             epoch_validators,
             self_node_id,
-            dp_writer,
-            shared_pdd,
             phantom: PhantomData,
         }
     }
 
-    fn update_role(&mut self, current_epoch: Epoch, new_role: SecondaryRaptorCastModeConfig) {
-        debug!(
-            ?new_role,
-            ?current_epoch,
-            "Updating secondary raptorcast role"
-        );
-
-        // create new channels
-        let (send_net_messages, recv_net_messages) =
-            unbounded_channel::<FullNodesGroupMessage<ST>>();
-        let (send_group_infos, recv_group_infos) = unbounded_channel::<Group<ST>>();
-
+    fn update_role(&mut self, _current_epoch: Epoch, new_role: SecondaryRaptorCastModeConfig) {
         let is_dynamic = matches!(new_role, SecondaryRaptorCastModeConfig::Client);
-        // we first need to update is_dynamic_full_node before binding the channels
         self.rc_primary.set_is_dynamic_full_node(is_dynamic);
-        self.rc_primary
-            .bind_channel_to_secondary_raptorcast(send_net_messages, recv_group_infos);
-
-        let rc_secondary = Self::build_secondary(
-            self.rc_config.clone(),
-            new_role,
-            self.dp_writer.clone(),
-            self.shared_pdd.clone(),
-            recv_net_messages,
-            send_group_infos,
-            current_epoch,
+        self.rc_secondary = None;
+        warn!(
+            ?new_role,
+            "role change requested but secondary raptorcast recreation not supported with multi-socket api"
         );
-        self.rc_secondary = rc_secondary;
     }
 
     fn build_secondary(
         cfg: RaptorCastConfig<ST>,
         mode: SecondaryRaptorCastModeConfig,
-        dp_writer: DataplaneWriter,
+        udp_writer: UdpSocketWriter,
         shared_pdd: Arc<Mutex<PeerDiscoveryDriver<PD>>>,
         recv_net_messages: UnboundedReceiver<FullNodesGroupMessage<ST>>,
         send_group_infos: UnboundedSender<Group<ST>>,
@@ -243,7 +229,7 @@ where
             _ => Some(RaptorCastSecondary::new(
                 cfg,
                 secondary_instance.mode,
-                dp_writer,
+                udp_writer,
                 shared_pdd,
                 recv_net_messages,
                 send_group_infos,

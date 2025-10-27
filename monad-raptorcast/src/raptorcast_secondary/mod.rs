@@ -33,7 +33,7 @@ use group_message::FullNodesGroupMessage;
 use monad_crypto::certificate_signature::{
     CertificateKeyPair, CertificateSignaturePubKey, CertificateSignatureRecoverable,
 };
-use monad_dataplane::{udp::segment_size_for_mtu, DataplaneWriter};
+use monad_dataplane::{udp::segment_size_for_mtu, UdpSocketWriter};
 use monad_executor::{Executor, ExecutorMetrics, ExecutorMetricsChain};
 use monad_executor_glue::{Message, PeerEntry, RouterCommand};
 use monad_peer_discovery::{driver::PeerDiscoveryDriver, PeerDiscoveryAlgo, PeerDiscoveryEvent};
@@ -80,10 +80,9 @@ where
     // Represents only the group logic, excluding everything network related.
     role: Role<ST>,
 
-    // Args for encoding outbound (validator -> full-node) messages
     curr_epoch: Epoch,
 
-    dataplane_writer: DataplaneWriter,
+    udp_writer: UdpSocketWriter,
     peer_discovery_driver: Arc<Mutex<PeerDiscoveryDriver<PD>>>,
     message_builder: OwnedMessageBuilder<ST, PD>,
 
@@ -103,7 +102,7 @@ where
     pub fn new(
         config: RaptorCastConfig<ST>,
         secondary_mode: SecondaryRaptorCastMode<ST>,
-        dataplane_writer: DataplaneWriter,
+        udp_writer: UdpSocketWriter,
         peer_discovery_driver: Arc<Mutex<PeerDiscoveryDriver<PD>>>,
         channel_from_primary: UnboundedReceiver<FullNodesGroupMessage<ST>>,
         channel_to_primary: UnboundedSender<Group<ST>>,
@@ -156,7 +155,7 @@ where
             role,
             curr_epoch: current_epoch,
             message_builder,
-            dataplane_writer,
+            udp_writer,
             peer_discovery_driver,
             channel_from_primary,
             metrics: Default::default(),
@@ -189,7 +188,7 @@ where
             .message_builder
             .build_unicast_msg(&msg_bytes, &build_target)
         {
-            self.dataplane_writer.udp_write_unicast(rc_chunks);
+            self.udp_writer.write_unicast(rc_chunks);
         }
     }
 
@@ -398,7 +397,7 @@ where
                         .build_unicast_msg(&outbound_message, &build_target)
                     {
                         // Send the raptorcast chunks via UDP to all peers in group
-                        self.dataplane_writer.udp_write_unicast(rc_chunks);
+                        self.udp_writer.write_unicast(rc_chunks);
                     }
                 }
             }
